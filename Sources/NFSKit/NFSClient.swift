@@ -23,6 +23,20 @@ public class NFSClient: NSObject {
     public private(set) var uid: Int32 = 0
     
     fileprivate var context: NFSContext?
+
+    /// One mounted context per export this client has visited, keyed by export name. `connect(export:)` switches `context` between them instead of
+    /// unmounting and remounting on every export change. (Sprocket Player fork.)
+    fileprivate var cachedContexts: [String: NFSContext] = [:]
+
+    /// Contexts are torn down here, never on the thread that happens to drop the last reference: `NFSContext.deinit` does a network unmount and a
+    /// destroy, both blocking. Serial, so teardowns never overlap either. (Sprocket Player fork.)
+    fileprivate static let teardownQueue = DispatchQueue(label: "NFSKit.teardown", qos: .utility)
+
+    /// Hands a context to the teardown queue; the closure holds the last strong reference, so its deinit runs there.
+    fileprivate static func retire(_ context: NFSContext?) {
+        guard let context else { return }
+        teardownQueue.async { _ = context }
+    }
     fileprivate let q: DispatchQueue
     fileprivate let connectLock = NSLock()
     fileprivate let operationLock = NSCondition()
@@ -64,7 +78,12 @@ public class NFSClient: NSObject {
         with(completionHandler: completionHandler) {
             self.connectLock.lock()
             defer { self.connectLock.unlock() }
-            if self.context == nil || self.context?.fileDescriptor == -1 || self.context?.export != export {
+            if let current = self.context, current.fileDescriptor != -1, current.export == export {
+                // already mounted on this export
+            } else if let cached = self.cachedContexts[export], cached.fileDescriptor != -1 {
+                self.context = cached
+            } else {
+                Self.retire(self.cachedContexts.removeValue(forKey: export))
                 self.context = try self.connnect(exportName: export)
             }
             
@@ -73,6 +92,7 @@ public class NFSClient: NSObject {
                 self.uid = uid
                 self.gid = gid
             } catch {
+                Self.retire(self.cachedContexts.removeValue(forKey: export))
                 self.context = try self.connnect(exportName: export)
             }
         }
@@ -112,6 +132,8 @@ public class NFSClient: NSObject {
                     self.operationLock.unlock()
                 }
                 try self.context?.disconnect()
+                if let export = self.context?.export { self.cachedContexts[export] = nil }
+                Self.retire(self.context)
                 self.context = nil
                 completionHandler?(nil)
             } catch {
@@ -134,6 +156,13 @@ public class NFSClient: NSObject {
     }
     
     
+    deinit {
+        let all = Array(cachedContexts.values) + (context.map { [$0] } ?? [])
+        cachedContexts.removeAll()
+        context = nil
+        for c in all { Self.retire(c) }
+    }
+
     /// List the exports of NFS server.
     /// - Parameter completionHandler: closure will be run after enumerating is completed.
     open func listExports(completionHandler: @escaping (_ result: Result<[String], Error>) -> Void) {
@@ -1105,12 +1134,13 @@ extension NFSClient {
         }
     }
     
-    fileprivate func connnect(exportName: String) throws -> NFSContext {
+    fileprivate func connnect(exportName: String, cache: Bool = true) throws -> NFSContext {
         let context = try NFSContext(timeout: _timeout)
         self.context = context
         context.timeout = timeout
         let server = url.host! + (url.port.map { ":\($0)" } ?? "")
         try context.connect(server: server, export: exportName)
+        if cache { cachedContexts[exportName] = context }
         return context
     }
     
@@ -1169,7 +1199,7 @@ extension NFSClient {
                              handler: @escaping (_ context: NFSContext) throws -> T) {
         queue {
             do {
-                let context = try self.connnect(exportName: exportName)
+                let context = try self.connnect(exportName: exportName, cache: false)   // one-shot; not kept
                 defer { try? context.disconnect() }
                 
                 let result = try handler(context)
