@@ -1114,6 +1114,26 @@ extension NFSClient {
         return context
     }
     
+    /**
+     Opens a file on the mounted export for random-access reads and keeps it open until the returned stream is closed or released. Intended for a
+     single reader thread (a demuxer); give the stream a client of its own rather than one shared with directory listings.
+     */
+    public func openReadStream(atPath path: String, completionHandler: @escaping (_ result: Result<NFSReadStream, Error>) -> Void) {
+        with(completionHandler: completionHandler) { context in
+            let file = try NFSFileHandle(forReadingAtPath: path, on: context)
+            let size = try Int64(file.fstat().nfs_size)
+            return NFSReadStream(file: file, size: size)
+        }
+    }
+
+    /// Async form of `openReadStream(atPath:completionHandler:)`.
+    @available(macOS 10.15, iOS 13, tvOS 13, *)
+    public func openReadStream(atPath path: String) async throws -> NFSReadStream {
+        try await withCheckedThrowingContinuation { continuation in
+            openReadStream(atPath: path) { continuation.resume(with: $0) }
+        }
+    }
+
     private func with(completionHandler: CompletionHandler, handler: @escaping () throws -> Void) {
         queue {
             do {
