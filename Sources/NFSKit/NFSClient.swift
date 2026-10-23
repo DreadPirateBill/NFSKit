@@ -1073,7 +1073,7 @@ extension NFSClient {
     fileprivate func populateResourceValue(_ dic: inout [URLResourceKey: Any], ent: nfsdirent) {
         dic[.fileSizeKey] = NSNumber(value: ent.size)
         dic[.linkCountKey] = NSNumber(value: ent.nlink)
-        dic[.documentIdentifierKey] = NSNumber(value: ent.uid)
+        dic[.documentIdentifierKey] = NSNumber(value: ent.inode)
         
         switch ent.type {
         case NF3REG.rawValue:
